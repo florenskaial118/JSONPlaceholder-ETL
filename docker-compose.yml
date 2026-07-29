@@ -1,0 +1,561 @@
+name: data-engineering-lab
+
+services:
+  postgres-dwh:
+    image: postgres:16
+    container_name: postgres-dwh
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: dwh
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dwh_data:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d
+      - ./materials/lecture_01_postgres/data:/data/lecture_01:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d dwh"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres-airflow:
+    profiles: ["airflow"]
+    image: postgres:16
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    profiles: ["s3"]
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio-init:
+    profiles: ["s3"]
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 admin password123 &&
+      mc mb --ignore-existing local/datalake &&
+      mc anonymous set download local/datalake
+      "
+
+  clickhouse:
+    profiles: ["clickhouse"]
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_DB: lab
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"
+      - "9002:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    mem_limit: 1g
+    cpus: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "admin", "--password", "admin", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  greenplum:
+    profiles: ["greenplum"]
+    build:
+      context: ./docker
+      dockerfile: greenplum-pxf/Dockerfile
+    container_name: greenplum
+    hostname: greenplum
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      PXF_DEFAULT_SOURCE: datalake/raw/orders/dt=2026-06-23/orders.csv
+      PXF_MOCK_PORT: 5888
+    ports:
+      - "5434:5432"
+    volumes:
+      - greenplum_pxf_data:/data
+    mem_limit: 2g
+    cpus: 1
+    shm_size: 1g
+    healthcheck:
+      test: ["CMD-SHELL", ". /opt/greenplum-db-6.8.1/greenplum_path.sh && pg_isready -U gpadmin -d postgres"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    profiles: ["kafka"]
+    image: bitnami/kafka:3.7
+    container_name: kafka
+    environment:
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,INTERNAL://:29092
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_NUM_PARTITIONS: 1
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CFG_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_CFG_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_CFG_LOG_RETENTION_HOURS: 24
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/bitnami/kafka
+    mem_limit: 1g
+    cpus: 1
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  namenode:
+    profiles: ["hive", "spark", "airflow"]
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    environment:
+      CLUSTER_NAME: data-engineering-lab
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      CORE_CONF_hadoop_proxyuser_hive_hosts: "*"
+      CORE_CONF_hadoop_proxyuser_hive_groups: "*"
+    ports:
+      - "8020:8020"
+      - "9870:9870"
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+
+  datanode:
+    profiles: ["hive", "spark", "airflow"]
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    depends_on:
+      - namenode
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      CORE_CONF_hadoop_proxyuser_hive_hosts: "*"
+      CORE_CONF_hadoop_proxyuser_hive_groups: "*"
+      HDFS_CONF_dfs_datanode_data_dir: file:///hadoop/dfs/data
+      SERVICE_PRECONDITION: namenode:9870
+    ports:
+      - "9864:9864"
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+
+  hdfs-init:
+    profiles: ["hive", "spark", "airflow"]
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: hdfs-init
+    depends_on:
+      - namenode
+      - datanode
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      CORE_CONF_hadoop_proxyuser_hive_hosts: "*"
+      CORE_CONF_hadoop_proxyuser_hive_groups: "*"
+      SERVICE_PRECONDITION: namenode:9870 datanode:9864
+    entrypoint: bash
+    command: >
+      -lc "
+      until timeout 1 bash -c '</dev/tcp/namenode/9870' 2>/dev/null; do sleep 2; done &&
+      until timeout 1 bash -c '</dev/tcp/datanode/9864' 2>/dev/null; do sleep 2; done &&
+      /opt/hadoop-3.2.1/bin/hdfs dfs -fs hdfs://namenode:8020 -mkdir -p /warehouse &&
+      /opt/hadoop-3.2.1/bin/hdfs dfs -fs hdfs://namenode:8020 -chown spark:supergroup /warehouse &&
+      /opt/hadoop-3.2.1/bin/hdfs dfs -fs hdfs://namenode:8020 -chmod 1777 /warehouse
+      "
+
+  hive-metastore-postgresql:
+    profiles: ["hive", "spark"]
+    image: bde2020/hive-metastore-postgresql:2.3.0
+    container_name: hive-metastore-postgresql
+    ports:
+      - "15432:5432"
+    volumes:
+      - hive_metastore_postgres_data:/var/lib/postgresql/data
+
+  hive-metastore:
+    profiles: ["hive", "spark"]
+    build:
+      context: ./docker/hive
+    container_name: hive-metastore
+    depends_on:
+      hdfs-init:
+        condition: service_completed_successfully
+      hive-metastore-postgresql:
+        condition: service_started
+    command: bash /opt/hive/bin/metastore-entrypoint.sh
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      CORE_CONF_hadoop_proxyuser_hive_hosts: "*"
+      CORE_CONF_hadoop_proxyuser_hive_groups: "*"
+      HADOOP_USER_NAME: hive
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionURL: jdbc:postgresql://hive-metastore-postgresql/metastore
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionDriverName: org.postgresql.Driver
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionUserName: hive
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionPassword: hive
+      HIVE_SITE_CONF_hive_metastore_warehouse_dir: hdfs://namenode:8020/warehouse
+      SERVICE_PRECONDITION: namenode:9870 datanode:9864 hive-metastore-postgresql:5432
+    ports:
+      - "9083:9083"
+    volumes:
+      - ./docker/hive/metastore-entrypoint.sh:/opt/hive/bin/metastore-entrypoint.sh:ro
+
+  hive-server:
+    profiles: ["hive", "spark"]
+    build:
+      context: ./docker/hive
+    container_name: hive-server
+    depends_on:
+      - hive-metastore
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      CORE_CONF_hadoop_proxyuser_hive_hosts: "*"
+      CORE_CONF_hadoop_proxyuser_hive_groups: "*"
+      HADOOP_USER_NAME: hive
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionURL: jdbc:postgresql://hive-metastore-postgresql/metastore
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionDriverName: org.postgresql.Driver
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionUserName: hive
+      HIVE_SITE_CONF_javax_jdo_option_ConnectionPassword: hive
+      HIVE_SITE_CONF_hive_metastore_uris: thrift://hive-metastore:9083
+      HIVE_SITE_CONF_hive_metastore_warehouse_dir: hdfs://namenode:8020/warehouse
+      SERVICE_PRECONDITION: hive-metastore:9083
+    ports:
+      - "10000:10000"
+
+  spark-master:
+    profiles: ["spark", "airflow"]
+    build:
+      context: ./docker/spark
+    container_name: spark-master
+    environment:
+      SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+      HADOOP_USER_NAME: spark
+      PYSPARK_PYTHON: /opt/bitnami/python/bin/python
+      PYSPARK_DRIVER_PYTHON: /opt/bitnami/python/bin/python
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ./:/app
+      - ./materials:/materials
+      - spark_local_data:/spark-local
+
+  spark-worker:
+    profiles: ["spark", "airflow"]
+    build:
+      context: ./docker/spark
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 1G
+      SPARK_WORKER_CORES: 1
+      HADOOP_USER_NAME: spark
+      PYSPARK_PYTHON: /opt/bitnami/python/bin/python
+      PYSPARK_DRIVER_PYTHON: /opt/bitnami/python/bin/python
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./:/app
+      - ./materials:/materials
+      - spark_local_data:/spark-local
+
+  jupyter:
+    profiles: ["spark"]
+    build:
+      context: ./docker/spark
+    container_name: jupyter
+    depends_on:
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+      postgres-dwh:
+        condition: service_started
+      minio:
+        condition: service_started
+      namenode:
+        condition: service_started
+      datanode:
+        condition: service_started
+      hdfs-init:
+        condition: service_completed_successfully
+      hive-metastore:
+        condition: service_started
+      hive-server:
+        condition: service_started
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      HADOOP_CONF_DIR: /opt/bitnami/spark/conf
+      HADOOP_USER_NAME: spark
+      SPARK_CONF_DIR: /opt/bitnami/spark/conf
+      HOME: /tmp
+      SPARK_SUBMIT_OPTS: -Duser.home=/tmp
+      PYSPARK_PYTHON: /opt/bitnami/python/bin/python
+      PYSPARK_DRIVER_PYTHON: /opt/bitnami/python/bin/python
+      POSTGRES_HOST: postgres-dwh
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: dwh
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: admin
+      S3_SECRET_KEY: password123
+      S3_BUCKET: datalake
+      HDFS_NAMENODE_URL: hdfs://namenode:8020
+      HDFS_WEBHDFS_URL: http://namenode:9870
+      HIVE_METASTORE_URI: thrift://hive-metastore:9083
+      HIVE_SERVER_HOST: hive-server
+      HIVE_SERVER_PORT: 10000
+      HIVE_SERVER_URL: jdbc:hive2://hive-server:10000/default
+      SPARK_LOCAL_DATA_DIR: /spark-local
+      PYTHONPATH: /materials:/opt/bitnami/spark/python:/opt/bitnami/spark/python/lib/py4j-0.10.9.7-src.zip
+    command: >
+      bash -lc "/opt/bitnami/python/bin/jupyter lab
+      --ip=0.0.0.0
+      --port=8888
+      --no-browser
+      --ServerApp.token=''
+      --ServerApp.password=''
+      --notebook-dir=/materials"
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - ./materials:/materials
+      - ./materials/seminar_02_raw/data:/home/student/seminar_02_raw/data:ro
+      - spark_local_data:/spark-local
+
+  airflow-init:
+    profiles: ["airflow"]
+    build:
+      context: ./docker/airflow
+    container_name: airflow-init
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__FERNET_KEY: ""
+      AIRFLOW__WEBSERVER__SECRET_KEY: lab_secret_key
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"spark://spark-master","port":7077}'
+      AIRFLOW_CONN_DWH_POSTGRES: postgresql://admin:admin@postgres-dwh:5432/dwh
+      AIRFLOW_CONN_MINIO_S3: '{"conn_type":"aws","login":"admin","password":"password123","extra":{"endpoint_url":"http://minio:9000","region_name":"us-east-1"}}'
+      AIRFLOW_CONN_CLICKHOUSE_DEFAULT: clickhouse://admin:admin@clickhouse:9000/default
+      AIRFLOW_CONN_GREENPLUM_DEFAULT: postgresql://gpadmin@greenplum:5432/postgres
+      HDFS_NAMENODE_URL: hdfs://namenode:8020
+      HDFS_WEBHDFS_URL: http://namenode:9870
+      HADOOP_USER_NAME: spark
+      SPARK_MASTER_URL: spark://spark-master:7077
+    command: >
+      bash -c "
+      airflow db migrate &&
+      airflow users list | grep -q admin ||
+      airflow users create
+      --username admin
+      --password admin
+      --firstname Admin
+      --lastname User
+      --role Admin
+      --email admin@example.com
+      "
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/jobs:/opt/airflow/jobs
+      - ./airflow/logs:/opt/airflow/logs
+
+  airflow-webserver:
+    profiles: ["airflow"]
+    build:
+      context: ./docker/airflow
+    container_name: airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres-dwh:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      greenplum:
+        condition: service_healthy
+      namenode:
+        condition: service_started
+      datanode:
+        condition: service_started
+      hdfs-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: lab_secret_key
+      POSTGRES_HOST: postgres-dwh
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: dwh
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: admin
+      S3_SECRET_KEY: password123
+      S3_BUCKET: datalake
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_HTTP_PORT: 8123
+      CLICKHOUSE_NATIVE_PORT: 9000
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin
+      GREENPLUM_HOST: greenplum
+      GREENPLUM_PORT: 5432
+      GREENPLUM_DB: postgres
+      GREENPLUM_USER: gpadmin
+      SPARK_MASTER_URL: spark://spark-master:7077
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"spark://spark-master","port":7077}'
+      AIRFLOW_CONN_DWH_POSTGRES: postgresql://admin:admin@postgres-dwh:5432/dwh
+      AIRFLOW_CONN_MINIO_S3: '{"conn_type":"aws","login":"admin","password":"password123","extra":{"endpoint_url":"http://minio:9000","region_name":"us-east-1"}}'
+      AIRFLOW_CONN_CLICKHOUSE_DEFAULT: clickhouse://admin:admin@clickhouse:9000/default
+      AIRFLOW_CONN_GREENPLUM_DEFAULT: postgresql://gpadmin@greenplum:5432/postgres
+      HDFS_NAMENODE_URL: hdfs://namenode:8020
+      HDFS_WEBHDFS_URL: http://namenode:9870
+      HADOOP_USER_NAME: spark
+      PYTHONPATH: /opt/airflow
+    command: webserver
+    ports:
+      - "8088:8080"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/jobs:/opt/airflow/jobs
+      - ./airflow/logs:/opt/airflow/logs
+
+  airflow-scheduler:
+    profiles: ["airflow"]
+    build:
+      context: ./docker/airflow
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres-dwh:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      greenplum:
+        condition: service_healthy
+      namenode:
+        condition: service_started
+      datanode:
+        condition: service_started
+      hdfs-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: lab_secret_key
+      POSTGRES_HOST: postgres-dwh
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: dwh
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_ACCESS_KEY: admin
+      S3_SECRET_KEY: password123
+      S3_BUCKET: datalake
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_HTTP_PORT: 8123
+      CLICKHOUSE_NATIVE_PORT: 9000
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: admin
+      GREENPLUM_HOST: greenplum
+      GREENPLUM_PORT: 5432
+      GREENPLUM_DB: postgres
+      GREENPLUM_USER: gpadmin
+      SPARK_MASTER_URL: spark://spark-master:7077
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type":"spark","host":"spark://spark-master","port":7077}'
+      AIRFLOW_CONN_DWH_POSTGRES: postgresql://admin:admin@postgres-dwh:5432/dwh
+      AIRFLOW_CONN_MINIO_S3: '{"conn_type":"aws","login":"admin","password":"password123","extra":{"endpoint_url":"http://minio:9000","region_name":"us-east-1"}}'
+      AIRFLOW_CONN_CLICKHOUSE_DEFAULT: clickhouse://admin:admin@clickhouse:9000/default
+      AIRFLOW_CONN_GREENPLUM_DEFAULT: postgresql://gpadmin@greenplum:5432/postgres
+      HDFS_NAMENODE_URL: hdfs://namenode:8020
+      HDFS_WEBHDFS_URL: http://namenode:9870
+      HADOOP_USER_NAME: spark
+      PYTHONPATH: /opt/airflow
+    command: scheduler
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/jobs:/opt/airflow/jobs
+      - ./airflow/logs:/opt/airflow/logs
+
+volumes:
+  postgres_dwh_data:
+  postgres_airflow_data:
+  minio_data:
+  clickhouse_data:
+  greenplum_data:
+  greenplum_pxf_data:
+  kafka_data:
+  hadoop_namenode:
+  hadoop_datanode:
+  hive_metastore_postgres_data:
+  spark_local_data:

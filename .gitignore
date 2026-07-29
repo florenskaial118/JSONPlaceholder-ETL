@@ -5,3 +5,4 @@ __pycache__/
 *.log
 airflow/airflow.db
 airflow/airflow.cfg
+airflow/logs/
